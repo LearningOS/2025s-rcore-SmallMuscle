@@ -45,6 +45,7 @@ pub struct TaskManagerInner {
     tasks: [TaskControlBlock; MAX_APP_NUM],
     /// id of current `Running` task
     current_task: usize,
+    sys_call_count: [AppSysCallCount; MAX_APP_NUM],
 }
 
 lazy_static! {
@@ -54,6 +55,10 @@ lazy_static! {
         let mut tasks = [TaskControlBlock {
             task_cx: TaskContext::zero_init(),
             task_status: TaskStatus::UnInit,
+        }; MAX_APP_NUM];
+        let app_sys_count: [AppSysCallCount; MAX_APP_NUM] = [AppSysCallCount {
+            call_ids: [0; SYS_CALL_NUM],
+            call_count: [0; SYS_CALL_NUM],
         }; MAX_APP_NUM];
         for (i, task) in tasks.iter_mut().enumerate() {
             task.task_cx = TaskContext::goto_restore(init_app_cx(i));
@@ -65,13 +70,55 @@ lazy_static! {
                 UPSafeCell::new(TaskManagerInner {
                     tasks,
                     current_task: 0,
+                    sys_call_count: app_sys_count,
                 })
             },
         }
     };
+
+}
+
+const SYS_CALL_NUM: usize = 6;
+
+#[derive(Copy, Clone)]
+struct AppSysCallCount {
+    pub call_ids: [usize; SYS_CALL_NUM],
+    pub call_count: [isize; SYS_CALL_NUM],
 }
 
 impl TaskManager {
+
+    fn count_syscall(&self, id: usize) -> isize {
+        let mut inner = self.inner.exclusive_access();
+        let cur_idx = inner.current_task;
+        let idx = Self::get_sys_call_idx(&inner.sys_call_count[cur_idx].call_ids, id);
+        inner.sys_call_count[cur_idx].call_ids[idx] = id;
+        let result = inner.sys_call_count[cur_idx].call_count[idx] + 1;
+        inner.sys_call_count[cur_idx].call_count[idx] = result;
+        drop(inner);
+        result
+    }
+
+    fn get_sys_call_count(&self, id: usize) -> isize {
+        let inner = self.inner.exclusive_access();
+        let cur_idx = inner.current_task;
+        let idx = Self::get_sys_call_idx(&inner.sys_call_count[cur_idx].call_ids, id);
+        let result = inner.sys_call_count[cur_idx].call_count[idx];
+        drop(inner);
+        result
+    }
+
+    fn get_sys_call_idx(arr: &[usize], id: usize) -> usize {
+        for i in 0..SYS_CALL_NUM {
+            if arr[i] == id {
+                return i;
+            } else if arr[i] == 0 {
+                return i;
+            }
+        }
+        panic!("System call count overflow!");
+    }
+
     /// Run the first task in task list.
     ///
     /// Generally, the first task in task list is an idle task (we call it zero process later).
@@ -168,4 +215,14 @@ pub fn suspend_current_and_run_next() {
 pub fn exit_current_and_run_next() {
     mark_current_exited();
     run_next_task();
+}
+
+/// Count syscall
+pub fn count_syscall(id: usize) -> isize {
+    TASK_MANAGER.count_syscall(id)
+}
+
+/// Get syscall count
+pub fn get_sys_call_count(id: usize) -> isize {
+    TASK_MANAGER.get_sys_call_count(id)
 }
