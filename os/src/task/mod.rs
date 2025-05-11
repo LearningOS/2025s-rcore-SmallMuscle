@@ -68,9 +68,30 @@ lazy_static! {
             },
         }
     };
+
 }
 
 impl TaskManager {
+    /// Count syscall
+    fn count_syscall(&self, id: usize) -> isize {
+        let mut inner = self.inner.exclusive_access();
+        let cur_idx = inner.current_task;
+        let task = &mut inner.tasks[cur_idx];
+        let result = task.count_syscall(id);
+        drop(inner);
+        result
+    }
+
+    /// Get syscall count
+    fn get_sys_call_count(&self, id: usize) -> isize {
+        let mut inner = self.inner.exclusive_access();
+        let cur_idx = inner.current_task;
+        let task = &mut inner.tasks[cur_idx];
+        let result = task.get_sys_call_count(id);
+        drop(inner);
+        result
+    }
+
     /// Run the first task in task list.
     ///
     /// Generally, the first task in task list is an idle task (we call it zero process later).
@@ -118,6 +139,24 @@ impl TaskManager {
     fn get_current_token(&self) -> usize {
         let inner = self.inner.exclusive_access();
         inner.tasks[inner.current_task].get_user_token()
+    }
+
+    /// map
+    fn map(&self, start: usize, len: usize, prot: usize) -> bool {
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        let result = inner.tasks[cur].map(start, len, prot);
+        drop(inner);
+        return result;
+    }
+
+    /// unmap
+    fn unmap(&self, start: usize, len: usize) -> bool {
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        let result = inner.tasks[cur].unmap(start, len);
+        drop(inner);
+        return result;
     }
 
     /// Get the current 'Running' task's trap contexts.
@@ -201,4 +240,29 @@ pub fn current_trap_cx() -> &'static mut TrapContext {
 /// Change the current 'Running' task's program break
 pub fn change_program_brk(size: i32) -> Option<usize> {
     TASK_MANAGER.change_current_program_brk(size)
+}
+
+/// Count syscall
+pub fn count_syscall(id: usize) -> isize {
+    TASK_MANAGER.count_syscall(id)
+}
+
+/// Get syscall count
+pub fn get_sys_call_count(id: usize) -> isize {
+    TASK_MANAGER.get_sys_call_count(id)
+}
+
+/// Get the current 'Running' task's memory set.
+pub fn current_user_memory_set() -> usize {
+    TASK_MANAGER.get_current_token()
+}
+
+/// map
+pub fn map(start: usize, len: usize, prot: usize) -> bool {
+    TASK_MANAGER.map(start, len, prot)
+}
+
+/// unmap
+pub fn unmap(start: usize, len: usize) -> bool {
+    TASK_MANAGER.unmap(start, len)
 }

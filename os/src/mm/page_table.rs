@@ -70,6 +70,10 @@ impl PageTableEntry {
     pub fn executable(&self) -> bool {
         (self.flags() & PTEFlags::X) != PTEFlags::empty()
     }
+    /// The page pointered by page table entry is user?
+    pub fn user(&self) -> bool {
+        (self.flags() & PTEFlags::U) != PTEFlags::empty()
+    }
 }
 
 /// page table structure
@@ -118,10 +122,20 @@ impl PageTable {
     /// Find PageTableEntry by VirtPageNum
     fn find_pte(&self, vpn: VirtPageNum) -> Option<&mut PageTableEntry> {
         let idxs = vpn.indexes();
+        let log_print = vpn.0 == 134217727;
+        if log_print {
+            info!("========================= kernel: find_pte idx: {:?}", idxs);
+        }
         let mut ppn = self.root_ppn;
         let mut result: Option<&mut PageTableEntry> = None;
         for (i, idx) in idxs.iter().enumerate() {
             let pte = &mut ppn.get_pte_array()[*idx];
+            if log_print {
+                info!(
+                    "========================= kernel: find_pte i {:?} pte: {:?} valid {:?}",
+                    i, pte.bits, pte.is_valid()
+                );
+            }
             if i == 2 {
                 result = Some(pte);
                 break;
@@ -178,4 +192,125 @@ pub fn translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Vec<&
         start = end_va.into();
     }
     v
+}
+
+/// Translate&Copy a ptr[u8] array with LENGTH len to a mutable u8 Vec through page table
+/// return None if the page table is not valid
+pub fn translated_byte_buffer_with_err(
+    token: usize,
+    ptr: *const u8,
+    len: usize,
+) -> Option<Vec<&'static mut [u8]>> {
+    let page_table = PageTable::from_token(token);
+    let mut start = ptr as usize;
+    let end = start + len;
+    let mut v = Vec::new();
+    while start < end {
+        let start_va = VirtAddr::from(start);
+        let mut vpn = start_va.floor();
+        if start == 9223372036854775807 {
+            info!(
+                "========================= kernel: translated_byte_buffer_with_err vpn: {:?}",
+                vpn.0
+            );
+        }
+        if let Some(page_table_entry) = page_table.translate(vpn) {
+            if !page_table_entry.user() || !page_table_entry.readable() {
+                return None;
+            }
+            let ppn = page_table_entry.ppn();
+            vpn.step();
+            let mut end_va: VirtAddr = vpn.into();
+            end_va = end_va.min(VirtAddr::from(end));
+            if end_va.page_offset() == 0 {
+                v.push(&mut ppn.get_bytes_array()[start_va.page_offset()..]);
+            } else {
+                v.push(&mut ppn.get_bytes_array()[start_va.page_offset()..end_va.page_offset()]);
+            }
+            if start < end_va.into() {
+                start = end_va.into();
+            } else {
+                break;
+            }
+        } else {
+            return None;
+        }
+    }
+    Some(v)
+}
+
+/// Write data ptr with LENGTH len to user space to the page table
+pub fn write_data_2_user(token: usize, ptr: *const u8, data: &[u8]) {
+    let page_table = PageTable::from_token(token);
+    let mut start = ptr as usize;
+    let len = data.len();
+    let mut data_idx = 0;
+    let end = start + len;
+    while start < end {
+        let start_va = VirtAddr::from(start);
+        let mut vpn = start_va.floor();
+        let ppn = page_table.translate(vpn).unwrap().ppn();
+        vpn.step();
+        let mut end_va: VirtAddr = vpn.into();
+        end_va = end_va.min(VirtAddr::from(end));
+        // println!("================== start {} end {}", start, end);
+        // println!(
+        //     "================== start offset {} end offset {}",
+        //     start_va.page_offset(),
+        //     end_va.page_offset()
+        // );
+        if end_va.page_offset() == 0 {
+            let dst = &mut ppn.get_bytes_array()[start_va.page_offset()..];
+            dst.copy_from_slice(&data[..dst.len()]);
+            data_idx += dst.len();
+        } else {
+            let dst = &mut ppn.get_bytes_array()[start_va.page_offset()..end_va.page_offset()];
+            dst.copy_from_slice(&data[data_idx..len]);
+        }
+        if start < end_va.into() {
+            start = end_va.into();
+        } else {
+            break;
+        }
+        // println!("================== next start {} end {}", start, end);
+    }
+}
+
+/// Write data ptr with LENGTH len to user space to the page table
+/// return None if the page table is not valid
+pub fn write_data_2_user_with_err(token: usize, ptr: *const u8, data: &[u8]) -> Option<()> {
+    let page_table = PageTable::from_token(token);
+    let mut start = ptr as usize;
+    let len = data.len();
+    let end = start + len;
+    let mut data_idx = 0;
+    while start < end {
+        let start_va = VirtAddr::from(start);
+        let mut vpn = start_va.floor();
+        if let Some(page_table_entry) = page_table.translate(vpn) {
+            if !page_table_entry.user() || !page_table_entry.writable() {
+                return None;
+            }
+            let ppn = page_table_entry.ppn();
+            vpn.step();
+            let mut end_va: VirtAddr = vpn.into();
+            end_va = end_va.min(VirtAddr::from(end));
+            if end_va.page_offset() == 0 {
+                let dst = &mut ppn.get_bytes_array()[start_va.page_offset()..];
+                dst.copy_from_slice(&data[..dst.len()]);
+                data_idx += dst.len();
+            } else {
+                let dst = &mut ppn.get_bytes_array()[start_va.page_offset()..end_va.page_offset()];
+                dst.copy_from_slice(&data[data_idx..len]);
+            }
+            if start < end_va.into() {
+                start = end_va.into();
+            } else {
+                break;
+            }
+        } else {
+            return None;
+        }
+    }
+    Some(())
 }

@@ -4,6 +4,7 @@ use crate::config::TRAP_CONTEXT_BASE;
 use crate::mm::{
     kernel_stack_position, MapPermission, MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE,
 };
+use alloc::vec::Vec;
 use crate::trap::{trap_handler, TrapContext};
 
 /// The task control block (TCB) of a task.
@@ -28,6 +29,12 @@ pub struct TaskControlBlock {
 
     /// Program break
     pub program_brk: usize,
+
+    /// syscall ids
+    pub call_ids: Vec<usize>,
+
+    /// syscall counts
+    pub call_counts: Vec<isize>,
 }
 
 impl TaskControlBlock {
@@ -39,6 +46,17 @@ impl TaskControlBlock {
     pub fn get_user_token(&self) -> usize {
         self.memory_set.token()
     }
+
+    /// map
+    pub fn map(&mut self, start: usize, len: usize, prot : usize) -> bool {
+        self.memory_set.map_to(VirtAddr::from(start), len, prot)
+    }
+    
+    /// unmap
+    pub fn unmap(&mut self, start: usize, len: usize) -> bool {
+        self.memory_set.unmap_from(VirtAddr::from(start), len)
+    }
+
     /// Based on the elf info in program, build the contents of task in a new address space
     pub fn new(elf_data: &[u8], app_id: usize) -> Self {
         // memory_set with elf program headers/trampoline/trap context/user stack
@@ -63,6 +81,8 @@ impl TaskControlBlock {
             base_size: user_sp,
             heap_bottom: user_sp,
             program_brk: user_sp,
+            call_ids: Vec::new(),
+            call_counts: Vec::new(),
         };
         // prepare TrapContext in user space
         let trap_cx = task_control_block.get_trap_cx();
@@ -95,6 +115,31 @@ impl TaskControlBlock {
         } else {
             None
         }
+    }
+
+    /// statistics count of syscall
+    pub fn count_syscall(&mut self, id: usize) -> isize {
+        let idx = self.get_sys_call_idx(id);
+        self.call_counts[idx] += 1;
+        self.call_counts[idx]
+    }
+
+    /// get the count of syscall
+    pub fn get_sys_call_count(&mut self, id: usize) -> isize {
+        let idx = self.get_sys_call_idx(id);
+        self.call_counts[idx]
+    }
+
+    /// get the index of syscall
+    fn get_sys_call_idx(&mut self, id: usize) -> usize {
+        for (idx, call_id) in self.call_ids.iter().enumerate() {
+            if *call_id == id {
+                return idx;
+            }
+        }
+        self.call_ids.push(id);
+        self.call_counts.push(0);
+        self.call_ids.len() - 1
     }
 }
 
