@@ -2,7 +2,7 @@
 use super::TaskContext;
 use super::{kstack_alloc, pid_alloc, KernelStack, PidHandle};
 use crate::config::TRAP_CONTEXT_BASE;
-use crate::mm::{MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE};
+use crate::mm::{MapPermission, MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE};
 use crate::sync::UPSafeCell;
 use crate::trap::{trap_handler, TrapContext};
 use alloc::sync::{Arc, Weak};
@@ -24,6 +24,8 @@ pub struct TaskControlBlock {
     inner: UPSafeCell<TaskControlBlockInner>,
 }
 
+const BIG_STRIDE: usize = 0x0000_FFFF;
+
 impl TaskControlBlock {
     /// Get the mutable reference of the inner TCB
     pub fn inner_exclusive_access(&self) -> RefMut<'_, TaskControlBlockInner> {
@@ -33,6 +35,16 @@ impl TaskControlBlock {
     pub fn get_user_token(&self) -> usize {
         let inner = self.inner_exclusive_access();
         inner.memory_set.token()
+    }
+    /// Refresh the stride of the current process
+    pub fn refresh_stride(&self) {
+        let mut inner = self.inner_exclusive_access();
+        let new_stride = inner.stride + BIG_STRIDE / inner.priority as usize;
+        if new_stride > inner.stride {
+            inner.stride = new_stride;
+        } else {
+            inner.stride = usize::MAX;
+        }
     }
 }
 
@@ -68,6 +80,12 @@ pub struct TaskControlBlockInner {
 
     /// Program break
     pub program_brk: usize,
+
+    /// Priority
+    pub priority: isize,
+
+    /// Stride
+    pub stride: usize,
 }
 
 impl TaskControlBlockInner {
@@ -118,6 +136,8 @@ impl TaskControlBlock {
                     exit_code: 0,
                     heap_bottom: user_sp,
                     program_brk: user_sp,
+                    priority: 16 as isize,
+                    stride: 0,
                 })
             },
         };
@@ -191,6 +211,8 @@ impl TaskControlBlock {
                     exit_code: 0,
                     heap_bottom: parent_inner.heap_bottom,
                     program_brk: parent_inner.program_brk,
+                    priority: 16 as isize,
+                    stride: 0,
                 })
             },
         });
@@ -206,6 +228,55 @@ impl TaskControlBlock {
         // ---- release parent PCB
     }
 
+    /// parent process spawn the child process and load a new elf to replace the original application 
+    /// address space and start execution
+    pub fn spawn(self: &Arc<Self>, elf_data: &[u8]) -> Arc<Self> {
+        // ---- access parent PCB exclusively
+        let mut parent_inner = self.inner_exclusive_access();
+        let (memory_set, user_sp, entry_point) = MemorySet::from_elf(elf_data);
+        let trap_cx_ppn = memory_set
+            .translate(VirtAddr::from(TRAP_CONTEXT_BASE).into())
+            .unwrap()
+            .ppn();
+        // alloc a pid and a kernel stack in kernel space
+        let pid_handle = pid_alloc();
+        let kernel_stack = kstack_alloc();
+        let kernel_stack_top = kernel_stack.get_top();
+        let task_control_block = Arc::new(TaskControlBlock {
+            pid: pid_handle,
+            kernel_stack,
+            inner: unsafe {
+                UPSafeCell::new(TaskControlBlockInner {
+                    trap_cx_ppn,
+                    base_size: user_sp,
+                    task_cx: TaskContext::goto_trap_return(kernel_stack_top),
+                    task_status: TaskStatus::Ready,
+                    memory_set,
+                    parent: Some(Arc::downgrade(self)),
+                    children: Vec::new(),
+                    exit_code: 0,
+                    heap_bottom: user_sp,
+                    program_brk: user_sp,
+                    priority: 16 as isize,
+                    stride: 0,
+                })
+            },
+        });
+        // add child
+        parent_inner.children.push(task_control_block.clone());
+        // modify kernel_sp in trap_cx
+        // **** access child PCB exclusively
+        let trap_cx = task_control_block.inner_exclusive_access().get_trap_cx();
+        *trap_cx = TrapContext::app_init_context(
+            entry_point,
+            user_sp,
+            KERNEL_SPACE.exclusive_access().token(),
+            kernel_stack_top,
+            trap_handler as usize,
+        );
+        task_control_block
+    }
+    
     /// get pid of process
     pub fn getpid(&self) -> usize {
         self.pid.0
@@ -235,6 +306,38 @@ impl TaskControlBlock {
         } else {
             None
         }
+    }
+
+    /// mmap. return None if failed.
+    pub fn mmap(&self, start: usize, len: usize, port: usize) -> Option<usize> {
+        let start_va = VirtAddr::from(start);
+        let end_va = VirtAddr::from(start + len);
+        let perm = ((port << 1) as u8 | 0b0001_0000) & 0b0001_1110;
+        if let Some(permission) = MapPermission::from_bits(perm) {
+            let mut inner = self.inner_exclusive_access();
+            inner.memory_set.mmap(start_va, end_va, permission)
+        } else {
+            None
+        }
+    }
+
+    /// munmap. return None if failed.
+    pub fn munmap(&self, start: usize, len: usize) -> Option<usize> {
+        let start_va = VirtAddr::from(start);
+        let end_va = VirtAddr::from(start + len);
+        let start_vpn = start_va.floor();
+        let end_vpn = end_va.ceil();
+        let mut inner = self.inner_exclusive_access();
+        inner.memory_set.munmap(start_vpn, end_vpn)
+    }
+    /// set priority. return None if failed.
+    pub fn set_priority(&self, priority: isize) -> Option<isize> {
+        if priority < 2 {
+            return None;
+        }
+        let mut inner = self.inner_exclusive_access();
+        inner.priority = priority;
+        Some(priority)
     }
 }
 
