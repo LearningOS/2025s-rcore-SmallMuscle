@@ -14,7 +14,7 @@ use alloc::vec::Vec;
 use core::fmt::{Debug, Formatter, Result};
 
 const EFS_MAGIC: u32 = 0x3b800001;
-const INODE_DIRECT_COUNT: usize = 28;
+const INODE_DIRECT_COUNT: usize = 27;
 const NAME_LENGTH_LIMIT: usize = 27;
 const INODE_INDIRECT1_COUNT: usize = BLOCK_SZ / 4;
 const INODE_INDIRECT2_COUNT: usize = INODE_INDIRECT1_COUNT * INODE_INDIRECT1_COUNT;
@@ -101,7 +101,8 @@ pub struct DiskInode {
     /// two-level indirect block id
     pub indirect2: u32,
     /// inode type
-    type_: DiskInodeType,
+    pub type_: DiskInodeType,
+    pub ref_count: u32,
 }
 
 impl DiskInode {
@@ -448,5 +449,9 @@ impl DirEntry {
     /// get the inode id of the directory entry
     pub fn inode_id(&self) -> u32 {
         self.inode_id
+    }
+    /// clear name
+    pub fn clear_name(&mut self) {
+        self.name.iter_mut().for_each(|v| *v = 0);
     }
 }

@@ -5,6 +5,8 @@ use crate::{
         current_process, current_task, current_user_token, exit_current_and_run_next, pid2process,
         suspend_current_and_run_next, SignalFlags,
     },
+    config::PAGE_SIZE,
+    timer::get_time_us,
 };
 use alloc::{string::String, sync::Arc, vec::Vec};
 
@@ -151,34 +153,62 @@ pub fn sys_kill(pid: usize, signal: u32) -> isize {
 /// YOUR JOB: get time with second and microsecond
 /// HINT: You might reimplement it with virtual memory management.
 /// HINT: What if [`TimeVal`] is splitted by two pages ?
-pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
+pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
     trace!(
         "kernel:pid[{}] sys_get_time NOT IMPLEMENTED",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    -1
+    let us = get_time_us();
+    let data = TimeVal {
+        sec: us / 1_000_000,
+        usec: us % 1_000_000,
+    };
+    *translated_refmut(current_user_token(), ts) = data;
+    0
 }
 
 /// mmap syscall
 ///
 /// YOUR JOB: Implement mmap.
-pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
+pub fn sys_mmap(start: usize, len: usize, port: usize) -> isize {
     trace!(
         "kernel:pid[{}] sys_mmap NOT IMPLEMENTED",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    -1
+    if !valid_addr(start) || !valid_prot(port) {
+        return -1;
+    }
+    let task = current_task().unwrap();
+    match task.process.upgrade().unwrap().mmap(start, len, port) {
+        Some(x) => x as isize,
+        _ => -1,
+    }
 }
 
 /// munmap syscall
 ///
 /// YOUR JOB: Implement munmap.
-pub fn sys_munmap(_start: usize, _len: usize) -> isize {
+pub fn sys_munmap(start: usize, len: usize) -> isize {
     trace!(
         "kernel:pid[{}] sys_munmap NOT IMPLEMENTED",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    -1
+    if !valid_addr(start) {
+        return -1;
+    }
+    let task = current_task().unwrap();
+    match task.process.upgrade().unwrap().munmap(start, len) {
+        Some(x) => x as isize,
+        _ => -1,
+    }
+}
+
+fn valid_addr(start: usize) -> bool {
+    start % PAGE_SIZE == 0
+}
+
+fn valid_prot(prot: usize) -> bool {
+    (prot & !0x7) == 0 && (prot & 0x7) != 0
 }
 
 /// change data segment size
@@ -193,21 +223,42 @@ pub fn sys_munmap(_start: usize, _len: usize) -> isize {
 /// spawn syscall
 /// YOUR JOB: Implement spawn.
 /// HINT: fork + exec =/= spawn
-pub fn sys_spawn(_path: *const u8) -> isize {
+pub fn sys_spawn(path: *const u8) -> isize {
     trace!(
         "kernel:pid[{}] sys_spawn NOT IMPLEMENTED",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    -1
+    let token = current_user_token();
+    let path = translated_str(token, path);
+    if let Some(data) = open_file(path.as_str(), OpenFlags::RDONLY) {
+        let all_data = data.read_all();
+        let process = current_process();
+        let new_process = process.spawn(&all_data.as_slice());
+        let new_pid = new_process.getpid();
+        // modify trap context of new_task, because it returns immediately after switching
+        let new_process_inner = new_process.inner_exclusive_access();
+        let task = new_process_inner.tasks[0].as_ref().unwrap();
+        let trap_cx = task.inner_exclusive_access().get_trap_cx();
+        // we do not have to move to next instruction since we have done it before
+        // for child process, fork returns 0
+        trap_cx.x[10] = 0;
+        new_pid as isize
+    } else {
+        -1
+    }
 }
 
 /// set priority syscall
 ///
 /// YOUR JOB: Set task priority
-pub fn sys_set_priority(_prio: isize) -> isize {
+pub fn sys_set_priority(prio: isize) -> isize {
     trace!(
         "kernel:pid[{}] sys_set_priority NOT IMPLEMENTED",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    -1
+    let process = current_process();
+    match process.set_priority(prio) {
+        Some(x) => x,
+        _ => -1,
+    }
 }

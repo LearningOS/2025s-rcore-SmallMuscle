@@ -1,4 +1,4 @@
-use crate::fs::{make_pipe, open_file, OpenFlags, Stat};
+use crate::fs::{make_pipe, open_file, linkat, unlink, OpenFlags, Stat};
 use crate::mm::{translated_byte_buffer, translated_refmut, translated_str, UserBuffer};
 use crate::task::{current_process, current_task, current_user_token};
 use alloc::sync::Arc;
@@ -124,28 +124,58 @@ pub fn sys_dup(fd: usize) -> isize {
 }
 
 /// YOUR JOB: Implement fstat.
-pub fn sys_fstat(_fd: usize, _st: *mut Stat) -> isize {
+pub fn sys_fstat(fd: usize, st: *mut Stat) -> isize {
     trace!(
         "kernel:pid[{}] sys_fstat NOT IMPLEMENTED",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    -1
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    if fd >= inner.fd_table.len() || fd < 3 {
+        return -1;
+    }
+    let mut result = -1;
+    if let Some(file) = &inner.fd_table[fd] {
+        let file = file.clone();
+        // release current task TCB manually to avoid multi-borrow
+        let (ino, mode, nlink) = file.get_ino_mode_nlink();
+        let data = Stat::new(ino, mode, nlink);
+        *translated_refmut(inner.memory_set.token(), st) = data;
+        result = 0;
+    }
+    drop(inner);
+    result
 }
 
 /// YOUR JOB: Implement linkat.
-pub fn sys_linkat(_old_name: *const u8, _new_name: *const u8) -> isize {
+pub fn sys_linkat(old_name: *const u8, new_name: *const u8) -> isize {
     trace!(
         "kernel:pid[{}] sys_linkat NOT IMPLEMENTED",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    -1
+    let token = current_user_token();
+    let old_path = translated_str(token, old_name);
+    let new_path = translated_str(token, new_name);
+    match linkat(old_path.as_str(), new_path.as_str()) {
+        true => {
+            0
+        },
+        false => -1,
+    }
 }
 
 /// YOUR JOB: Implement unlinkat.
-pub fn sys_unlinkat(_name: *const u8) -> isize {
+pub fn sys_unlinkat(name: *const u8) -> isize {
     trace!(
         "kernel:pid[{}] sys_unlinkat NOT IMPLEMENTED",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    -1
+    let token = current_user_token();
+    let path = translated_str(token, name);
+    match unlink(path.as_str()) {
+        true => {
+            0
+        },
+        false => -1,
+    }
 }

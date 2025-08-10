@@ -176,4 +176,10 @@ impl File for Pipe {
             }
         }
     }
+    
+    // TODO: implement this
+    fn get_ino_mode_nlink(&self) -> (u64, super::StatMode, u32) {
+        todo!()
+    }
+
 }

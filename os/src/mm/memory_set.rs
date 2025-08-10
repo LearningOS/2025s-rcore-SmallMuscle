@@ -293,6 +293,48 @@ impl MemorySet {
             false
         }
     }
+
+    /// mmap. return None if failed.
+    pub fn mmap(
+        &mut self,
+        start_va: VirtAddr,
+        end_va: VirtAddr,
+        permission: MapPermission,
+    ) -> Option<usize> {
+        let start_vpn = start_va.floor();
+        let end_vpn = end_va.ceil();
+        info!("mmap: start_va: {:?}, end_va: {:?}", start_va, end_va);
+        info!("mmap: start_vpn: {:?}, end_vpn: {:?}", start_vpn, end_vpn);
+        if let Some(_) = self.areas.iter().find(|area| {
+            area.vpn_range.get_start() <= start_vpn && area.vpn_range.get_end() > start_vpn
+                || area.vpn_range.get_start() < end_vpn && area.vpn_range.get_end() >= end_vpn
+        }) {
+            None
+        } else {
+            self.insert_framed_area(start_va, end_va, permission);
+            Some(0)
+        }
+    }
+
+    /// munmap. return None if failed.
+    pub fn munmap(&mut self, start_vpn: VirtPageNum, end_vpn: VirtPageNum) -> Option<usize> {
+        info!("munmap: start_vpn: {:?}, end_vpn: {:?}", start_vpn, end_vpn);
+        let (_, remove): (Vec<_>, Vec<_>) = self.areas.drain(..).partition(|area| {
+            if area.vpn_range.get_start() != start_vpn || area.vpn_range.get_end() != end_vpn {
+                true
+            } else {
+                false
+            }
+        });
+        if remove.len() == 0 {
+            return None;
+        }
+        for mut area in remove {
+            area.unmap(&mut self.page_table);
+        }
+        self.remove_area_with_start_vpn(start_vpn);
+        Some(0)
+    }
 }
 
 pub struct MapArea {

@@ -6,9 +6,10 @@ use super::TaskControlBlock;
 use super::{add_task, SignalFlags};
 use super::{pid_alloc, PidHandle};
 use crate::fs::{File, Stdin, Stdout};
-use crate::mm::{translated_refmut, MemorySet, KERNEL_SPACE};
+use crate::mm::{translated_refmut, VirtAddr, MapPermission, MemorySet, KERNEL_SPACE};
 use crate::sync::{Condvar, Mutex, Semaphore, UPSafeCell};
 use crate::trap::{trap_handler, TrapContext};
+// use crate::config::TRAP_CONTEXT_BASE;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
@@ -49,6 +50,8 @@ pub struct ProcessControlBlockInner {
     pub semaphore_list: Vec<Option<Arc<Semaphore>>>,
     /// condvar list
     pub condvar_list: Vec<Option<Arc<Condvar>>>,
+    /// Priority
+    pub priority: usize,
 }
 
 impl ProcessControlBlockInner {
@@ -119,6 +122,7 @@ impl ProcessControlBlock {
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
+                    priority: 16 as usize,
                 })
             },
         });
@@ -245,6 +249,7 @@ impl ProcessControlBlock {
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
+                    priority: 16 as usize,
                 })
             },
         });
@@ -281,5 +286,89 @@ impl ProcessControlBlock {
     /// get pid
     pub fn getpid(&self) -> usize {
         self.pid.0
+    }
+
+    /// set priority. return None if failed.
+    pub fn set_priority(&self, priority: isize) -> Option<isize> {
+        if priority < 2 {
+            return None;
+        }
+        let mut inner = self.inner_exclusive_access();
+        inner.priority = priority as usize;
+        Some(priority)
+    }
+
+    /// mmap. return None if failed.
+    pub fn mmap(&self, start: usize, len: usize, port: usize) -> Option<usize> {
+        let start_va = VirtAddr::from(start);
+        let end_va = VirtAddr::from(start + len);
+        let perm = ((port << 1) as u8 | 0b0001_0000) & 0b0001_1110;
+        if let Some(permission) = MapPermission::from_bits(perm) {
+            let mut inner = self.inner_exclusive_access();
+            inner.memory_set.mmap(start_va, end_va, permission)
+        } else {
+            None
+        }
+    }
+
+    /// munmap. return None if failed.
+    pub fn munmap(&self, start: usize, len: usize) -> Option<usize> {
+        let start_va = VirtAddr::from(start);
+        let end_va = VirtAddr::from(start + len);
+        let start_vpn = start_va.floor();
+        let end_vpn = end_va.ceil();
+        let mut inner = self.inner_exclusive_access();
+        inner.memory_set.munmap(start_vpn, end_vpn)
+    }
+
+    pub fn spawn(self: &Arc<Self>, elf_data: &[u8]) -> Arc<Self> {
+        // ---- access parent PCB exclusively
+        let mut parent_inner = self.inner_exclusive_access();
+        let (memory_set, user_sp, entry_point) = MemorySet::from_elf(elf_data);
+        // alloc a pid and a kernel stack in kernel space
+        let pid_handle = pid_alloc();
+        let mut new_fd_table: Vec<Option<Arc<dyn File + Send + Sync>>> = Vec::new();
+        for fd in parent_inner.fd_table.iter() {
+            if let Some(file) = fd {
+                new_fd_table.push(Some(file.clone()));
+            } else {
+                new_fd_table.push(None);
+            }
+        }
+        let child = Arc::new(Self {
+            pid: pid_handle,
+            inner: unsafe {
+                UPSafeCell::new(ProcessControlBlockInner {
+                    is_zombie: false,
+                    memory_set,
+                    parent: Some(Arc::downgrade(self)),
+                    children: Vec::new(),
+                    exit_code: 0,
+                    fd_table: new_fd_table,
+                    signals: SignalFlags::empty(),
+                    tasks: Vec::new(),
+                    task_res_allocator: RecycleAllocator::new(),
+                    mutex_list: Vec::new(),
+                    semaphore_list: Vec::new(),
+                    condvar_list: Vec::new(),
+                    priority: 16 as usize,
+                })
+            },
+        });
+        // add child
+        parent_inner.children.push(child.clone());
+        let task = Arc::new(TaskControlBlock::new(
+            Arc::clone(&child),
+            user_sp,
+                true
+        ));
+        let mut task_inner = task.inner_exclusive_access();
+        let trap_cx = TrapContext::app_init_context(entry_point, user_sp, 
+            KERNEL_SPACE.exclusive_access().token(), task.kstack.get_top(), trap_handler as usize);
+        task_inner.trap_cx_ppn = task_inner.res.as_mut().unwrap().trap_cx_ppn();
+        *task_inner.get_trap_cx() = trap_cx;
+        drop(task_inner);
+        insert_into_pid2process(child.getpid(), Arc::clone(&child));
+        child
     }
 }
