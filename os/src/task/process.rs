@@ -6,8 +6,9 @@ use super::TaskControlBlock;
 use super::{add_task, SignalFlags};
 use super::{pid_alloc, PidHandle};
 use crate::fs::{File, Stdin, Stdout};
-use crate::mm::{translated_refmut, VirtAddr, MapPermission, MemorySet, KERNEL_SPACE};
+use crate::mm::{translated_refmut, MapPermission, MemorySet, VirtAddr, KERNEL_SPACE};
 use crate::sync::{Condvar, Mutex, Semaphore, UPSafeCell};
+use crate::syscall::MUTEX_CHECK_DEADLOCK;
 use crate::trap::{trap_handler, TrapContext};
 // use crate::config::TRAP_CONTEXT_BASE;
 use alloc::string::String;
@@ -52,6 +53,133 @@ pub struct ProcessControlBlockInner {
     pub condvar_list: Vec<Option<Arc<Condvar>>>,
     /// Priority
     pub priority: usize,
+    /// enable deadlock detection
+    enable_deadlock_detection: isize,
+    /// mutex avaliable list
+    mutex_avaliable_list: Vec<Option<Arc<MutexInfo>>>,
+    /// mutex allocated list
+    mutex_allocated_list: Vec<Option<Arc<NeedMutexInfo>>>,
+    /// mutex need list
+    mutex_need_list: Vec<Option<Arc<NeedMutexInfo>>>,
+    /// mutex finished list
+    mutex_finished_list: Vec<Option<Arc<FinishedMutexInfo>>>,
+}
+
+struct MutexInfo {
+    inner: UPSafeCell<MutexInfoInner>,
+}
+
+struct MutexInfoInner {
+    /// mutex id
+    id: isize,
+    /// mutex count
+    count: isize,
+}
+
+impl MutexInfo {
+    pub fn new(id: isize, count: isize) -> Self {
+        Self {
+            inner: unsafe { UPSafeCell::new(MutexInfoInner { id, count }) },
+        }
+    }
+
+    pub fn get_id(&self) -> isize {
+        self.inner.exclusive_access().id
+    }
+
+    pub fn allocate(&self, count: isize) -> bool {
+        if self.inner.exclusive_access().count >= count {
+            self.inner.exclusive_access().count -= count;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn release(&self, count: isize) {
+        self.inner.exclusive_access().count += count;
+    }
+}
+
+struct NeedMutexInfo {
+    inner: UPSafeCell<NeedMutexInfoInner>,
+}
+
+struct NeedMutexInfoInner {
+    /// tid
+    tid: isize,
+    /// mutex id
+    mutex_info: Vec<Arc<MutexInfo>>,
+}
+
+impl NeedMutexInfo {
+    pub fn new(tid: isize, mutex_info: Vec<Arc<MutexInfo>>) -> Self {
+        Self {
+            inner: unsafe { UPSafeCell::new(NeedMutexInfoInner { tid, mutex_info }) },
+        }
+    }
+
+    pub fn get_tid(&self) -> isize {
+        self.inner.exclusive_access().tid
+    }
+
+    pub fn exists_mutex(&self, id: isize) -> bool {
+        self.inner
+            .exclusive_access()
+            .mutex_info
+            .iter()
+            .any(|item| item.get_id() == id)
+    }
+
+    pub fn add_mutex_info(&self, mutex_info: Arc<MutexInfo>) {
+        self.inner.exclusive_access().mutex_info.push(mutex_info);
+    }
+
+    pub fn remove_mutex_info(&self, mutex_id: isize) -> bool {
+        let mut inner = self.inner.exclusive_access();
+
+        if let Some(pos) = inner
+            .mutex_info
+            .iter()
+            .position(|item| item.get_id() == mutex_id)
+        {
+            inner.mutex_info.remove(pos);
+            return true;
+        }
+
+        false
+    }
+}
+
+struct FinishedMutexInfo {
+    inner: UPSafeCell<FinishedMutexInfoInner>,
+}
+
+struct FinishedMutexInfoInner {
+    /// mutex name
+    pub tid: isize,
+    /// mutex count
+    pub is_finished: bool,
+}
+
+impl FinishedMutexInfo {
+    pub fn new(tid: isize, is_finished: bool) -> Self {
+        Self {
+            inner: unsafe { UPSafeCell::new(FinishedMutexInfoInner { tid, is_finished }) },
+        }
+    }
+
+    pub fn get_tid(&self) -> isize {
+        self.inner.exclusive_access().tid
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.inner.exclusive_access().is_finished
+    }
+
+    pub fn set_finished(&self, is_finished: bool) {
+        self.inner.exclusive_access().is_finished = is_finished;
+    }
 }
 
 impl ProcessControlBlockInner {
@@ -84,6 +212,128 @@ impl ProcessControlBlockInner {
     /// get a task with tid in this process
     pub fn get_task(&self, tid: usize) -> Arc<TaskControlBlock> {
         self.tasks[tid].as_ref().unwrap().clone()
+    }
+
+    pub fn init_mutex_list(&mut self, mutex_id: isize, mutex_count: isize) -> isize {
+        if self.enable_deadlock_detection != 1 {
+            return 0;
+        }
+
+        if self
+            .mutex_avaliable_list
+            .iter()
+            .filter_map(|item| item.as_ref())
+            .any(|item| item.get_id() == mutex_id)
+        {
+            return 0;
+        } else {
+            self.mutex_avaliable_list
+                .push(Some(Arc::new(MutexInfo::new(mutex_id, mutex_count))));
+        }
+
+        0
+    }
+
+    pub fn try_lock(&mut self, tid: isize, mutex_id: isize, mutex_count: isize) -> isize {
+        if self.enable_deadlock_detection != 1 {
+            return 0;
+        }
+
+        // find need or init
+        if let Some(need_info) = self
+            .mutex_need_list
+            .iter_mut()
+            .filter_map(|item| item.as_mut())
+            .find(|item| item.get_tid() == tid)
+        {
+            // init mutex_info
+            if !need_info.exists_mutex(mutex_id) {
+                need_info.add_mutex_info(Arc::new(MutexInfo::new(mutex_id, mutex_count)));
+            }
+        } else {
+            // init need
+            self.mutex_need_list.push(Some(Arc::new(NeedMutexInfo::new(
+                tid,
+                vec![Arc::new(MutexInfo::new(mutex_id, mutex_count))],
+            ))));
+        }
+
+        // find finished or init
+        if let Some(finished_info) = self
+            .mutex_finished_list
+            .iter_mut()
+            .filter_map(|item| item.as_mut())
+            .find(|item| item.get_tid() == tid)
+        {
+            if finished_info.is_finished() {
+                return 0;
+            }
+        } else {
+            // init finished
+            self.mutex_finished_list
+                .push(Some(Arc::new(FinishedMutexInfo::new(tid, false))));
+        }
+
+        // find available
+        if let Some(available_info) = self
+            .mutex_avaliable_list
+            .iter_mut()
+            .filter_map(|item| item.as_mut())
+            .find(|item| item.get_id() == mutex_id)
+        {
+            let mutex_info = available_info.clone();
+            if available_info.allocate(mutex_count) {
+                self.mutex_allocated_list
+                    .push(Some(Arc::new(NeedMutexInfo::new(tid, vec![mutex_info]))));
+                return 0;
+            }
+        }
+        // check finished
+        if self
+            .mutex_finished_list
+            .iter()
+            .filter_map(|item| item.as_ref())
+            .all(|info| info.is_finished())
+        {
+            0
+        } else {
+            MUTEX_CHECK_DEADLOCK
+        }
+    }
+
+    pub fn mutex_release(&mut self, tid: isize, mutex_id: isize, mutex_count: isize) -> isize {
+        if self.enable_deadlock_detection != 1 {
+            return 0;
+        }
+
+        if let Some(allocated_info) = self
+            .mutex_allocated_list
+            .iter_mut()
+            .filter_map(|item| item.as_mut())
+            .find(|item| item.get_tid() == tid)
+        {
+            if allocated_info.remove_mutex_info(mutex_id) {
+                if let Some(available_info) = self
+                    .mutex_avaliable_list
+                    .iter_mut()
+                    .filter_map(|item| item.as_mut())
+                    .find(|item| item.get_id() == mutex_id)
+                {
+                    available_info.release(mutex_count);
+                }
+                // 修改 finished_list 中的 is_finished 状态
+                if let Some(finished_info) = self
+                    .mutex_finished_list
+                    .iter_mut()
+                    .filter_map(|item| item.as_mut())
+                    .find(|item| item.get_tid() == tid)
+                {
+                    finished_info.set_finished(true);
+                }
+            }
+        }
+
+        0
     }
 }
 
@@ -123,6 +373,11 @@ impl ProcessControlBlock {
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
                     priority: 16 as usize,
+                    enable_deadlock_detection: 0,
+                    mutex_avaliable_list: Vec::new(),
+                    mutex_allocated_list: Vec::new(),
+                    mutex_need_list: Vec::new(),
+                    mutex_finished_list: Vec::new(),
                 })
             },
         });
@@ -250,6 +505,11 @@ impl ProcessControlBlock {
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
                     priority: 16 as usize,
+                    enable_deadlock_detection: 0,
+                    mutex_avaliable_list: Vec::new(),
+                    mutex_allocated_list: Vec::new(),
+                    mutex_need_list: Vec::new(),
+                    mutex_finished_list: Vec::new(),
                 })
             },
         });
@@ -286,6 +546,17 @@ impl ProcessControlBlock {
     /// get pid
     pub fn getpid(&self) -> usize {
         self.pid.0
+    }
+
+    /// enable deadlock detection
+    pub fn enable_deadlock_detection(&self, is_enable: isize) -> isize {
+        let mut inner = self.inner_exclusive_access();
+        if is_enable != 0 && is_enable != 1 {
+            -1
+        } else {
+            inner.enable_deadlock_detection = is_enable;
+            0
+        }
     }
 
     /// set priority. return None if failed.
@@ -352,19 +623,25 @@ impl ProcessControlBlock {
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
                     priority: 16 as usize,
+                    enable_deadlock_detection: 0,
+                    mutex_avaliable_list: Vec::new(),
+                    mutex_allocated_list: Vec::new(),
+                    mutex_need_list: Vec::new(),
+                    mutex_finished_list: Vec::new(),
                 })
             },
         });
         // add child
         parent_inner.children.push(child.clone());
-        let task = Arc::new(TaskControlBlock::new(
-            Arc::clone(&child),
-            user_sp,
-                true
-        ));
+        let task = Arc::new(TaskControlBlock::new(Arc::clone(&child), user_sp, true));
         let mut task_inner = task.inner_exclusive_access();
-        let trap_cx = TrapContext::app_init_context(entry_point, user_sp, 
-            KERNEL_SPACE.exclusive_access().token(), task.kstack.get_top(), trap_handler as usize);
+        let trap_cx = TrapContext::app_init_context(
+            entry_point,
+            user_sp,
+            KERNEL_SPACE.exclusive_access().token(),
+            task.kstack.get_top(),
+            trap_handler as usize,
+        );
         task_inner.trap_cx_ppn = task_inner.res.as_mut().unwrap().trap_cx_ppn();
         *task_inner.get_trap_cx() = trap_cx;
         drop(task_inner);

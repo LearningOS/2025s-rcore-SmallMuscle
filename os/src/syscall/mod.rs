@@ -99,6 +99,9 @@ pub const SYSCALL_CONDVAR_SIGNAL: usize = 472;
 /// condvar_wait syscallca
 pub const SYSCALL_CONDVAR_WAIT: usize = 473;
 
+/// mutex check deadlock
+pub const MUTEX_CHECK_DEADLOCK: isize = -0xDEAD;
+
 mod fs;
 mod process;
 mod sync;
